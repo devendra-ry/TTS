@@ -122,13 +122,13 @@ app.add_middleware(
 def _to_wav_bytes(audio_list: list, sr: int = SAMPLE_RATE) -> bytes:
     audio = np.concatenate(audio_list)
     buf = io.BytesIO()
-    sf.write(buf, audio, sr, format="WAV")
+    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
     return buf.getvalue()
 
 
 def _chunk_to_wav_bytes(audio_chunk: np.ndarray, sr: int = SAMPLE_RATE) -> bytes:
     buf = io.BytesIO()
-    sf.write(buf, audio_chunk, sr, format="WAV")
+    sf.write(buf, audio_chunk, sr, format="WAV", subtype="PCM_16")
     return buf.getvalue()
 
 
@@ -313,7 +313,7 @@ async def tts_custom_stream(
     if pause.size > 0:
         pause_wav_b64 = base64.b64encode(_chunk_to_wav_bytes(pause, SAMPLE_RATE)).decode()
 
-    async def _generator():
+    def _generator():
         t_start = time.perf_counter()
         first_chunk = True
         ttfa_ms = None
@@ -428,7 +428,7 @@ async def tts_clone_stream(
     if pause.size > 0:
         pause_wav_b64 = base64.b64encode(_chunk_to_wav_bytes(pause, SAMPLE_RATE)).decode()
 
-    async def _generator():
+    def _generator():
         t_start = time.perf_counter()
         first_chunk = True
         ttfa_ms = None
