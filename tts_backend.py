@@ -51,11 +51,12 @@ def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-CUSTOM_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"
-BASE_MODEL_ID   = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+CUSTOM_MODEL_ID = os.getenv("CUSTOM_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+BASE_MODEL_ID   = os.getenv("BASE_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
 MAX_TEXT_LEN    = _env_int("MAX_TEXT_LEN", 300000, min_value=1000)
-MODEL_CHUNK_TEXT_LEN = _env_int("MODEL_CHUNK_TEXT_LEN", 450, min_value=50)
-CHUNK_JOIN_SILENCE_MS = _env_int("CHUNK_JOIN_SILENCE_MS", 150, min_value=0)
+MODEL_CHUNK_TEXT_LEN = _env_int("MODEL_CHUNK_TEXT_LEN", 700, min_value=100)
+CHUNK_JOIN_SILENCE_MS = _env_int("CHUNK_JOIN_SILENCE_MS", 0, min_value=0)
+STREAM_CHUNK_SIZE = _env_int("STREAM_CHUNK_SIZE", 10, min_value=1)
 SAMPLE_RATE     = 24_000
 
 SPEAKERS = ["serena", "vivian", "uncle_fu", "ryan", "aiden",
@@ -243,6 +244,7 @@ async def health():
         "max_text_length": MAX_TEXT_LEN,
         "model_chunk_text_length": MODEL_CHUNK_TEXT_LEN,
         "chunk_join_silence_ms": CHUNK_JOIN_SILENCE_MS,
+        "stream_chunk_size": STREAM_CHUNK_SIZE,
         "vram": _vram_info(),
     }
 
@@ -318,7 +320,7 @@ async def tts_custom_stream(
         total_duration = 0.0
         try:
             for idx, text_chunk in enumerate(text_chunks):
-                kwargs = dict(text=text_chunk, language=language, speaker=speaker, chunk_size=8)
+                kwargs = dict(text=text_chunk, language=language, speaker=speaker, chunk_size=STREAM_CHUNK_SIZE)
                 if instruct:
                     kwargs["instruct"] = instruct
 
@@ -436,7 +438,7 @@ async def tts_clone_stream(
                 for audio_chunk, sr, timing in model.generate_voice_clone_streaming(
                     text=text_chunk, language=language,
                     ref_audio=tmp_path, ref_text=ref_text,
-                    chunk_size=8,
+                    chunk_size=STREAM_CHUNK_SIZE,
                 ):
                     if first_chunk:
                         ttfa_ms = round((time.perf_counter() - t_start) * 1000, 1)

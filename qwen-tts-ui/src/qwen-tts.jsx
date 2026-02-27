@@ -20,12 +20,26 @@ function wavBytesToFloat32(b64) {
   return samples;
 }
 
-function float32ToWavBlob(samples, sampleRate = 24000) {
+function base64ToBytes(b64) {
+  const raw = atob(b64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+function wavChunksToWavBlob(chunksB64, sampleRate = 24000) {
+  const pcmChunks = chunksB64
+    .map(base64ToBytes)
+    .filter((bytes) => bytes.length > 44)
+    .map((bytes) => bytes.subarray(44)); // strip per-chunk WAV header
+
+  if (!pcmChunks.length) return null;
+
   const bytesPerSample = 2;
   const numChannels = 1;
-  const dataSize = samples.length * bytesPerSample;
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
+  const dataSize = pcmChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+  const out = new Uint8Array(44 + dataSize);
+  const view = new DataView(out.buffer);
 
   const writeStr = (offset, str) => {
     for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
@@ -46,12 +60,11 @@ function float32ToWavBlob(samples, sampleRate = 24000) {
   view.setUint32(40, dataSize, true);
 
   let offset = 44;
-  for (let i = 0; i < samples.length; i++) {
-    const s = Math.max(-1, Math.min(1, samples[i]));
-    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
-    offset += 2;
-  }
-  return new Blob([buffer], { type: "audio/wav" });
+  pcmChunks.forEach((chunk) => {
+    out.set(chunk, offset);
+    offset += chunk.length;
+  });
+  return new Blob([out], { type: "audio/wav" });
 }
 
 /* ─── Inline styles ──────────────────────────────────────────────────────── */
@@ -363,7 +376,6 @@ export default function QwenTTS() {
   // Audio
   const [audioUrl, setAudioUrl]     = useState(null);
   const [metrics, setMetrics]       = useState(null); // {ttfa_ms, rtf}
-  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
   const audioRef                    = useRef(null);
   const abortRef                    = useRef(null);
   const audioCtxRef                 = useRef(null);
@@ -393,24 +405,6 @@ export default function QwenTTS() {
   useEffect(() => {
     return () => { audioCtxRef.current?.close(); };
   }, []);
-
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (!audio) return undefined;
-
-    const sync = () => setIsAudioPlaying(!audio.paused);
-    const onEnded = () => setIsAudioPlaying(false);
-    audio.addEventListener("play", sync);
-    audio.addEventListener("pause", sync);
-    audio.addEventListener("ended", onEnded);
-    setIsAudioPlaying(!audio.paused);
-
-    return () => {
-      audio.removeEventListener("play", sync);
-      audio.removeEventListener("pause", sync);
-      audio.removeEventListener("ended", onEnded);
-    };
-  }, [audioUrl]);
 
   const clearState = useCallback(() => {
     setError("");
@@ -452,10 +446,17 @@ export default function QwenTTS() {
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
-    audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-    nextPlayTimeRef.current = audioCtxRef.current.currentTime + 0.05;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    try {
+      audioCtxRef.current = new AudioCtx({ latencyHint: "playback" });
+    } catch {
+      audioCtxRef.current = new AudioCtx();
+    }
+    await audioCtxRef.current.resume().catch(() => {});
+    nextPlayTimeRef.current = audioCtxRef.current.currentTime + 0.18;
 
-    const allPcmChunks = [];
+    const allChunks = [];
+    let outputSampleRate = 24000;
 
     const r = await fetch(`${API}${endpoint}`, {
       method: "POST",
@@ -489,17 +490,24 @@ export default function QwenTTS() {
           setMetrics({ ttfa_ms: msg.ttfa_ms, rtf: msg.rtf });
           setStatus("Done.");
         } else if (msg.chunk) {
-          // Decode once per chunk, then use for both playback and final WAV.
+          allChunks.push(msg.chunk);
+          outputSampleRate = msg.sample_rate || outputSampleRate;
+
+          // Decode per chunk for live playback (non-fatal if decode fails).
           try {
             const pcm  = wavBytesToFloat32(msg.chunk);
-            allPcmChunks.push(pcm);
             const ctx  = audioCtxRef.current;
-            const buf  = ctx.createBuffer(1, pcm.length, 24000);
+            const sr = msg.sample_rate || 24000;
+            const buf  = ctx.createBuffer(1, pcm.length, sr);
             buf.copyToChannel(pcm, 0);
             const src  = ctx.createBufferSource();
             src.buffer = buf;
             src.connect(ctx.destination);
-            const startAt = Math.max(nextPlayTimeRef.current, ctx.currentTime);
+            const minLead = 0.12;
+            if (nextPlayTimeRef.current < ctx.currentTime + minLead) {
+              nextPlayTimeRef.current = ctx.currentTime + minLead;
+            }
+            const startAt = nextPlayTimeRef.current;
             src.start(startAt);
             nextPlayTimeRef.current = startAt + buf.duration;
           } catch {/* non-fatal */ }
@@ -507,15 +515,9 @@ export default function QwenTTS() {
       }
     }
 
-    if (allPcmChunks.length) {
-      const totalSamples = allPcmChunks.reduce((sum, chunk) => sum + chunk.length, 0);
-      const merged = new Float32Array(totalSamples);
-      let offset = 0;
-      allPcmChunks.forEach((chunk) => {
-        merged.set(chunk, offset);
-        offset += chunk.length;
-      });
-      const wavBlob = float32ToWavBlob(merged, 24000);
+    if (allChunks.length) {
+      const wavBlob = wavChunksToWavBlob(allChunks, outputSampleRate);
+      if (!wavBlob) return;
       const url = URL.createObjectURL(wavBlob);
       setAudioUrl(url);
     }
@@ -570,42 +572,10 @@ export default function QwenTTS() {
     audioCtxRef.current?.suspend();
   };
 
-  const download = () => {
-    if (!audioUrl) return;
-    const a = document.createElement("a");
-    a.href = audioUrl;
-    a.download = "qwen_tts_output.wav";
-    a.click();
-  };
-
-  const togglePlayPause = () => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    if (audio.paused) {
-      audio.play().catch(() => {});
-    } else {
-      audio.pause();
-    }
-  };
-
-  const seekBy = (seconds) => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    const duration = Number.isFinite(audio.duration) ? audio.duration : Number.MAX_SAFE_INTEGER;
-    const next = Math.max(0, Math.min(duration, audio.currentTime + seconds));
-    audio.currentTime = next;
-  };
-
-  const restart = () => {
-    const audio = audioRef.current;
-    if (!audio) return;
-    audio.currentTime = 0;
-    audio.play().catch(() => {});
-  };
-
   const charOver = text.length > maxText;
   const canGenerate = !loading && text.trim().length > 0 && !charOver &&
     (mode === "custom" || (refAudio && refText.trim()));
+  const showOutputPanel = !!audioUrl;
 
   return (
     <div style={css.root}>
@@ -779,7 +749,7 @@ export default function QwenTTS() {
         )}
 
         {/* Audio output */}
-        {audioUrl && (
+        {showOutputPanel && (
           <div style={css.panel}>
             <label style={css.label}>Output</label>
             <div style={css.audioWrap}>
@@ -796,24 +766,6 @@ export default function QwenTTS() {
                 </span>
               </div>
             )}
-
-            <div style={css.actionRow}>
-              <button style={css.btn("secondary")} onClick={togglePlayPause}>
-                {isAudioPlaying ? "Pause" : "Play"}
-              </button>
-              <button style={css.btn("secondary")} onClick={() => seekBy(-10)}>
-                Rewind 10s
-              </button>
-              <button style={css.btn("secondary")} onClick={() => seekBy(10)}>
-                Forward 10s
-              </button>
-              <button style={css.btn("secondary")} onClick={restart}>
-                Restart
-              </button>
-              <button style={css.btn("secondary")} onClick={download}>
-                Download WAV
-              </button>
-            </div>
           </div>
         )}
       </div>
