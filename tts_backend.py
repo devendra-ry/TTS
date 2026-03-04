@@ -38,9 +38,7 @@ import base64
 import asyncio
 import logging
 import os
-import pathlib
 import queue as _stdlib_queue
-import tempfile
 import threading
 import time
 import re
@@ -53,7 +51,7 @@ import soundfile as sf
 import torch
 import torchaudio
 
-from fastapi import FastAPI, Form, File, UploadFile, HTTPException
+from fastapi import FastAPI, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
 
@@ -71,7 +69,6 @@ except importlib.metadata.PackageNotFoundError:
     raise RuntimeError("transformers not installed. Run: pip install 'transformers>=4.52.1'")
 
 # ── Memory / compile config ───────────────────────────────────────────────────
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 os.environ.setdefault("NO_TORCH_COMPILE", "1")   # Mimi uses torch.compile; skip on GTX 1650
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -152,8 +149,19 @@ def _load_model_sync() -> dict:
     model.eval()
     log.info("Model loaded in %.1f s", time.perf_counter() - t0)
 
+    # With device_map="auto" the model is sharded across devices.
+    # model.device returns "cpu" in that case, which would move inputs to CPU
+    # and cause silent no-output or a device mismatch. Resolve the real target
+    # device from the device map instead.
+    if torch.cuda.is_available():
+        infer_device = torch.device("cuda")
+    else:
+        infer_device = torch.device("cpu")
+    log.info("Inference device resolved to: %s", infer_device)
+
     _model_cache["model"]     = model
     _model_cache["processor"] = processor
+    _model_cache["device"]    = infer_device
     _model_loaded = True
     return _model_cache
 
@@ -285,7 +293,10 @@ def _split_text(text: str, max_chars: int = MODEL_CHUNK_TEXT_LEN) -> list[str]:
             _flush()
             current = sentence
     _flush()
-    return [c for c in chunks if c]
+    # Reject chunks that are purely punctuation / whitespace or too short for the
+    # depth decoder (a single non-letter token can make codebook input[0] == 0,
+    # which triggers the CUDA assertion in TensorCompare.cu).
+    return [c for c in chunks if c and len(c.strip()) >= 2 and any(ch.isalnum() for ch in c)]
 
 
 def _vram_info() -> dict:
@@ -307,18 +318,25 @@ def _vram_info() -> dict:
 
 # ── CSM inference ─────────────────────────────────────────────────────────────
 
-def _csm_generate(model, processor, text: str, speaker_id: int) -> np.ndarray:
+def _csm_generate(model, processor, text: str, speaker_id: int, device) -> np.ndarray:
     """Generate speech for one text chunk using a built-in speaker embedding.
 
     Conversation format (confirmed from official model card):
         conversation = [{"role": "0", "content": [{"type": "text", "text": "..."}]}]
         inputs = processor.apply_chat_template(conversation, tokenize=True, return_dict=True)
         audio  = model.generate(**inputs, output_audio=True)  # → (1, num_samples) tensor
+    
+    NOTE: device must be passed explicitly — model.device returns "cpu" when
+    device_map="auto" is used, which would silently move inputs to CPU.
     """
+    text = text.strip()
+    if not text or not any(ch.isalnum() for ch in text):
+        raise ValueError(f"Skipping degenerate chunk (no alphanumeric content): {text!r}")
+
     conversation = [{"role": str(speaker_id), "content": [{"type": "text", "text": text}]}]
     inputs = processor.apply_chat_template(
         conversation, tokenize=True, return_dict=True
-    ).to(model.device)
+    ).to(device)
 
     with torch.no_grad():
         audio = model.generate(**inputs, output_audio=True)
@@ -328,46 +346,6 @@ def _csm_generate(model, processor, text: str, speaker_id: int) -> np.ndarray:
     return out
 
 
-def _csm_generate_clone(
-    model, processor,
-    text: str, speaker_id: int,
-    ref_audio_np: np.ndarray, ref_text: str,
-) -> np.ndarray:
-    """Generate speech matching the voice in ref_audio_np.
-
-    CSM voice cloning works via conversation context: a turn containing both
-    the reference transcript and the reference waveform is prepended so the
-    model learns the target speaker's characteristics.
-
-    Audio context format (confirmed from official model card):
-        {"role": "0", "content": [
-            {"type": "text",  "text": ref_text},
-            {"type": "audio", "path": ref_audio_numpy_array},  # float32, 24 kHz, mono
-        ]}
-    """
-    conversation = [
-        {
-            "role": str(speaker_id),
-            "content": [
-                {"type": "text",  "text": ref_text},
-                {"type": "audio", "path": ref_audio_np},  # numpy array accepted directly
-            ],
-        },
-        {
-            "role": str(speaker_id),
-            "content": [{"type": "text", "text": text}],
-        },
-    ]
-    inputs = processor.apply_chat_template(
-        conversation, tokenize=True, return_dict=True
-    ).to(model.device)
-
-    with torch.no_grad():
-        audio = model.generate(**inputs, output_audio=True)
-
-    out = _tensor_to_numpy(audio)
-    del inputs, audio
-    return out
 
 
 # ── Async producer-consumer streaming pipeline ────────────────────────────────
@@ -446,6 +424,21 @@ async def _stream_audio(iter_fns: list, cleanup: Optional[callable] = None):
     except torch.cuda.OutOfMemoryError:
         gc.collect(); torch.cuda.empty_cache()
         yield json.dumps({"error": "CUDA OOM — try shorter text.", "done": True}) + "\n"
+    except (torch.cuda.CudaError, RuntimeError) as exc:
+        # Catches device-side assert (AcceleratorError / CudaError) and other
+        # CUDA runtime errors so uvicorn does not see an unhandled exception.
+        err_s = str(exc)
+        if "device-side assert" in err_s or "CUDA error" in err_s:
+            log.error("CUDA device-side assert — restarting process recommended: %s", exc)
+            gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            yield json.dumps({"error": "CUDA assertion triggered — server restart may be required.", "done": True}) + "\n"
+        else:
+            log.exception("Unexpected runtime error in audio stream")
+            yield json.dumps({"error": err_s, "done": True}) + "\n"
     except Exception as exc:
         log.exception("Unexpected error in audio stream")
         yield json.dumps({"error": str(exc), "done": True}) + "\n"
@@ -486,14 +479,14 @@ async def tts_generate(text: str = Form(...), speaker_id: int = Form(0)):
     """Synthesise the full text and return one WAV file."""
     _validate_text(text); _validate_speaker(speaker_id)
     mc = await _get_model()
-    model, processor = mc["model"], mc["processor"]
+    model, processor, device = mc["model"], mc["processor"], mc["device"]
     chunks  = _split_text(text)
     silence = np.zeros(int(SAMPLE_RATE * CHUNK_JOIN_SILENCE_MS / 1000), dtype=np.float32)
     try:
         parts: list[np.ndarray] = []
         for idx, tc in enumerate(chunks):
             np_ = await asyncio.get_event_loop().run_in_executor(
-                None, lambda t=tc: _csm_generate(model, processor, t, speaker_id))
+                None, lambda t=tc: _csm_generate(model, processor, t, speaker_id, device))
             if idx > 0 and silence.size > 0:
                 parts.append(silence)
             parts.append(np_)
@@ -516,12 +509,12 @@ async def tts_generate_stream(text: str = Form(...), speaker_id: int = Form(0)):
     """
     _validate_text(text); _validate_speaker(speaker_id)
     mc = await _get_model()
-    model, processor = mc["model"], mc["processor"]
+    model, processor, device = mc["model"], mc["processor"], mc["device"]
     chunks = _split_text(text)
 
     def _make_iter(tc: str):
         def _iter():
-            yield _csm_generate(model, processor, tc, speaker_id), SAMPLE_RATE, None
+            yield _csm_generate(model, processor, tc, speaker_id, device), SAMPLE_RATE, None
         return _iter
 
     return StreamingResponse(
@@ -529,91 +522,3 @@ async def tts_generate_stream(text: str = Form(...), speaker_id: int = Form(0)):
         media_type="application/x-ndjson",
     )
 
-
-# ── /tts/clone  (non-streaming) ──────────────────────────────────────────────
-@app.post("/tts/clone")
-async def tts_clone(
-    text:       str        = Form(...),
-    speaker_id: int        = Form(0),
-    ref_text:   str        = Form(...),
-    ref_audio:  UploadFile = File(...),
-):
-    """Synthesise text matching the voice in ref_audio.
-    ref_audio: WAV file of the target voice (3+ seconds recommended).
-    ref_text:  Exact words spoken in the reference recording.
-    """
-    _validate_text(text); _validate_speaker(speaker_id)
-    if not ref_text.strip():
-        raise HTTPException(status_code=422, detail="ref_text must not be empty.")
-
-    audio_bytes = await ref_audio.read()
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(audio_bytes); tmp_path = tmp.name
-
-    try:
-        ref_np = _load_ref_audio(tmp_path)
-    except Exception as exc:
-        pathlib.Path(tmp_path).unlink(missing_ok=True)
-        raise HTTPException(status_code=422, detail=f"Could not read reference audio: {exc}")
-
-    mc = await _get_model()
-    model, processor = mc["model"], mc["processor"]
-    chunks  = _split_text(text)
-    silence = np.zeros(int(SAMPLE_RATE * CHUNK_JOIN_SILENCE_MS / 1000), dtype=np.float32)
-    try:
-        parts: list[np.ndarray] = []
-        for idx, tc in enumerate(chunks):
-            np_ = await asyncio.get_event_loop().run_in_executor(
-                None, lambda t=tc: _csm_generate_clone(model, processor, t, speaker_id, ref_np, ref_text))
-            if idx > 0 and silence.size > 0:
-                parts.append(silence)
-            parts.append(np_)
-        wav = _numpy_to_wav(np.concatenate(parts) if parts else np.array([], dtype=np.float32))
-    except torch.cuda.OutOfMemoryError:
-        gc.collect(); torch.cuda.empty_cache()
-        raise HTTPException(status_code=503, detail="CUDA OOM — try shorter text.")
-    finally:
-        pathlib.Path(tmp_path).unlink(missing_ok=True)
-        gc.collect(); torch.cuda.empty_cache()
-    return Response(content=wav, media_type="audio/wav",
-                    headers={"Content-Disposition": "attachment; filename=output.wav"})
-
-
-# ── /tts/clone/stream ────────────────────────────────────────────────────────
-@app.post("/tts/clone/stream")
-async def tts_clone_stream(
-    text:       str        = Form(...),
-    speaker_id: int        = Form(0),
-    ref_text:   str        = Form(...),
-    ref_audio:  UploadFile = File(...),
-):
-    _validate_text(text); _validate_speaker(speaker_id)
-    if not ref_text.strip():
-        raise HTTPException(status_code=422, detail="ref_text must not be empty.")
-
-    audio_bytes = await ref_audio.read()
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(audio_bytes); tmp_path = tmp.name
-
-    try:
-        ref_np = _load_ref_audio(tmp_path)
-    except Exception as exc:
-        pathlib.Path(tmp_path).unlink(missing_ok=True)
-        raise HTTPException(status_code=422, detail=f"Could not read reference audio: {exc}")
-
-    mc = await _get_model()
-    model, processor = mc["model"], mc["processor"]
-    chunks = _split_text(text)
-
-    def _make_iter(tc: str):
-        def _iter():
-            yield _csm_generate_clone(model, processor, tc, speaker_id, ref_np, ref_text), SAMPLE_RATE, None
-        return _iter
-
-    return StreamingResponse(
-        _stream_audio(
-            [_make_iter(tc) for tc in chunks],
-            cleanup=lambda: pathlib.Path(tmp_path).unlink(missing_ok=True),
-        ),
-        media_type="application/x-ndjson",
-    )
