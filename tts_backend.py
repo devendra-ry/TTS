@@ -125,8 +125,8 @@ def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-CUSTOM_MODEL_ID       = os.getenv("CUSTOM_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
-BASE_MODEL_ID         = os.getenv("BASE_MODEL_ID",   "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+CUSTOM_MODEL_ID       = os.getenv("CUSTOM_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+BASE_MODEL_ID         = os.getenv("BASE_MODEL_ID",   "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
 MAX_TEXT_LEN          = _env_int("MAX_TEXT_LEN",          300_000, min_value=1_000)
 MODEL_CHUNK_TEXT_LEN  = _env_int("MODEL_CHUNK_TEXT_LEN",  700,     min_value=100)
 CHUNK_JOIN_SILENCE_MS = _env_int("CHUNK_JOIN_SILENCE_MS", 0,       min_value=0)
