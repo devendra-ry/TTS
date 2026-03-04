@@ -2,59 +2,75 @@
 tts_backend.py — Qwen3-TTS FastAPI Backend
 GTX 1650 optimised (4 GB VRAM)
 
-Streaming smoothness — this revision
-──────────────────────────────────────
-JITTER-FIX-1  Sync generator serialised inference and network I/O
-  Root cause: _make_stream_generator returned a *synchronous* generator.
-  Starlette's StreamingResponse wraps sync generators with iterate_in_threadpool,
-  which dispatches every next() call to run_in_executor. The resulting timeline
-  per chunk was:
+Slow-motion + jitter fixes (this revision)
+───────────────────────────────────────────
 
-      [event loop]  dispatch next() → thread pool
-      [thread]      GPU inference (blocking)
-      [thread]      yield PCM line
-      [event loop]  receive, write to socket
-      [event loop]  await socket flush
-      [event loop]  dispatch next() → thread pool   ← back to top
+BUG-1  SLOW MOTION — hardcoded sample rate in WAV header
+  The streaming WAV header was built with SAMPLE_RATE=24_000 BEFORE any
+  model output was seen.  The model returns the actual sample rate in every
+  chunk as chunk_sr.  If chunk_sr != SAMPLE_RATE (e.g. model variant outputs
+  22 050 Hz, or a resampling wrapper returns 48 000 Hz) then:
+      playback_speed = declared_sr / actual_sr
+  A 2x mismatch (declared 24 000, actual 48 000) gives exactly the
+  "talking in slow motion" symptom — pitch and tempo both halved.
 
-  Inference and network I/O were strictly SERIALIZED. The GPU sat idle during
-  socket flushes; the client buffer drained during GPU inference. At RTF ≈ 1.2
-  on the GTX 1650 with chunk_size=4 (~333 ms audio), the client was starved for
-  ~72 ms on every single chunk — enough for an audible click/gap.
+  Fix (part of BUG-2 fix below): every queue item is a complete WAV file
+  whose header is built from the chunk's own chunk_sr, so the declared rate
+  always matches the data regardless of what the model returns.
 
-  Fix: async producer-consumer pipeline using queue.Queue.
-  • A background thread (producer) runs model inference continuously, converting
-    each audio_chunk to raw PCM16 and putting it in a bounded queue.
-  • An async generator (consumer) awaits each queue.get via run_in_executor and
-    yields the NDJSON line immediately without blocking the event loop.
-  • Inference and network I/O now run CONCURRENTLY — the GPU never idles waiting
-    for a network flush, and the consumer always has a chunk ready to send.
+BUG-2  SLOW MOTION / FORMAT — streaming WAV header + raw PCM over NDJSON
+  The previous revision split the audio into a one-time "wav_header" message
+  followed by raw "pcm_s16le" messages.  This custom binary protocol breaks
+  every standard audio decoder:
 
-JITTER-FIX-2  Per-segment cold-start with no pre-roll
-  Root cause: the pre_roll_filled flag turned True after the first
-  PRE_ROLL_CHUNKS *global* chunks. At every subsequent text-segment boundary:
-  • pre_roll_filled was already True
-  • iter_fn() triggered a full model prefill for the new segment (~300-800 ms)
-  • No chunks were buffered during prefill → client queue drained → stutter
+    • Browser decodeAudioData (most common path):
+        wav_header msg  → decodeAudioData(44 bytes) → error / silence
+        pcm_s16le msg   → decodeAudioData(raw int16) → error
+      Result: SILENCE.
 
-  Fix: the bounded queue (maxsize = PRE_ROLL_CHUNKS + 2) acts as the pre-roll
-  buffer for EVERY segment automatically. Because the producer thread runs
-  ahead of the consumer, it fills the queue (up to maxsize) before blocking.
-  When moving to the next text segment the producer is already working on
-  segment N+1 while the consumer is still draining segment N — the prefill
-  latency is hidden behind the queue fill.
+    • Client buffers everything then decodes:
+      Must receive the full stream before playback starts — not streaming.
+
+    • Client manually converts int16 → Float32Array:
+      The ONLY path that works. Requires bespoke code. Any mistake in the
+      client's assumed sample rate gives SLOW MOTION (e.g. using the
+      AudioContext's default 48 000 Hz instead of 24 000 Hz for the buffer
+      means 24 000 samples play in 24000/48000 = 0.5 seconds → half-speed).
+
+  Fix: revert to per-chunk COMPLETE WAV files.  Each queue item is a
+  standalone WAV (44-byte header + PCM body) at the correct chunk_sr.
+  Browser decodeAudioData works on every chunk independently, and the
+  embedded sample rate is always correct.
+
+  The boundary glitch that existed in the original code was a CLIENT-SIDE
+  scheduling bug (AudioBufferSourceNode not given an explicit start time),
+  NOT a server format bug.  The right fix is proper client scheduling, not
+  changing the server format.
+
+BUG-3  JITTER — queue too shallow for RTF > 1 on GTX 1650
+  Queue size was PRE_ROLL_CHUNKS(2) + 2 = 4 chunks × 333 ms = 1.33 s.
+  At RTF=1.3 (typical for this card on longer text) the queue drains at
+  100 ms/chunk and is empty after only 4.3 s of audio.  All subsequent
+  chunks arrive late → repeating ~100 ms gaps.
+
+  Fix: raise PRE_ROLL_CHUNKS default to 6 → queue = 8 chunks = 2.67 s.
+  At RTF=1.3 the queue now covers 6.7 s before any starvation, which is
+  enough for the majority of TTS requests.
 
 Previous fixes
 ──────────────
 SMOOTH-FIX-1  Per-chunk WAV headers → one streaming header + raw PCM
-SMOOTH-FIX-2  STREAM_CHUNK_SIZE 10→4 tokens (833 ms → 333 ms per chunk)
-SMOOTH-FIX-3  Added PRE_ROLL_CHUNKS global pre-roll buffer
-FIX-1  tempfile/pathlib imported inside functions → module level
-FIX-2  asyncio.Lock guards _model_cache / _active_model_id
-FIX-3  _load_model blocked event loop → async wrapper + run_in_executor
-FIX-4  _run_in_executor misleading *args removed
-FIX-5  Lambda closures captured loop variable by reference → default-arg bind
-FIX-6  Unhandled exceptions in stream generators silently truncated the stream
+              (REVERTED — the streaming header format was the bug)
+SMOOTH-FIX-2  STREAM_CHUNK_SIZE 10→4 tokens (833 ms → 333 ms)  [kept]
+SMOOTH-FIX-3  PRE_ROLL_CHUNKS global pre-roll                    [extended to 6]
+JITTER-FIX-1  Async producer-consumer pipeline                   [kept]
+JITTER-FIX-2  Per-segment pre-roll via bounded queue             [kept]
+FIX-1   tempfile/pathlib inside functions → module level
+FIX-2   asyncio.Lock guards _model_cache / _active_model_id
+FIX-3   _load_model blocked event loop → async + run_in_executor
+FIX-4   _run_in_executor misleading *args removed
+FIX-5   Lambda closures by reference → default-arg capture
+FIX-6   Unhandled exceptions silently truncated stream
 """
 
 import gc
@@ -66,7 +82,6 @@ import logging
 import os
 import pathlib
 import queue as _stdlib_queue
-import struct
 import tempfile
 import threading
 import time
@@ -115,15 +130,12 @@ BASE_MODEL_ID         = os.getenv("BASE_MODEL_ID",   "Qwen/Qwen3-TTS-12Hz-0.6B-B
 MAX_TEXT_LEN          = _env_int("MAX_TEXT_LEN",          300_000, min_value=1_000)
 MODEL_CHUNK_TEXT_LEN  = _env_int("MODEL_CHUNK_TEXT_LEN",  700,     min_value=100)
 CHUNK_JOIN_SILENCE_MS = _env_int("CHUNK_JOIN_SILENCE_MS", 0,       min_value=0)
-# 4 tokens at 12 Hz codec = ~333 ms of audio per chunk — below the perceptible
-# stutter threshold.  Increase for lower CPU/network overhead; decrease for
-# lower latency.
+# 4 tokens × (24 000 / 12) samples/token = 8 000 samples = 333 ms per chunk.
 STREAM_CHUNK_SIZE     = _env_int("STREAM_CHUNK_SIZE",     4,       min_value=1)
-# The producer thread fills the queue up to this many chunks before blocking.
-# Acts as a pre-roll buffer at the start of EVERY text segment (not just the
-# first), hiding GPU prefill latency at segment boundaries.
-PRE_ROLL_CHUNKS       = _env_int("PRE_ROLL_CHUNKS",       2,       min_value=0)
-SAMPLE_RATE           = 24_000
+# BUG-3 FIX: was 2 (1.33 s buffer). 6 gives 2.67 s → covers RTF≈1.3 for
+# up to 6.7 s of audio before any queue starvation.
+PRE_ROLL_CHUNKS       = _env_int("PRE_ROLL_CHUNKS",       6,       min_value=0)
+SAMPLE_RATE           = 24_000   # fallback; actual rate always comes from chunk_sr
 
 SPEAKERS = ["serena", "vivian", "uncle_fu", "ryan", "aiden",
             "ono_anna", "sohee", "eric", "dylan"]
@@ -190,48 +202,36 @@ app.add_middleware(
 
 # ── Audio helpers ─────────────────────────────────────────────────────────────
 def _to_wav_bytes(audio_list: list, sr: int = SAMPLE_RATE) -> bytes:
-    """Non-streaming path: encode the full concatenated audio as one WAV file."""
-    audio = np.concatenate(audio_list)
+    """Non-streaming: encode the full concatenated audio as one WAV file."""
     buf = io.BytesIO()
-    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
+    sf.write(buf, np.concatenate(audio_list), sr, format="WAV", subtype="PCM_16")
     return buf.getvalue()
 
 
-def _streaming_wav_header(sr: int, channels: int = 1) -> bytes:
-    """44-byte WAV header with 0xFFFFFFFF sentinel sizes (open-ended streaming).
+def _chunk_to_wav_bytes(audio_chunk: np.ndarray, sr: int) -> bytes:
+    """BUG-1 + BUG-2 FIX: encode a single chunk as a complete, standalone WAV.
 
-    Setting both RIFF chunk-size and data sub-chunk size to 0xFFFFFFFF is the
-    de-facto standard for streaming WAV.  Browsers' MediaSource extensions and
-    most native players accept it and consume audio continuously until the
-    connection closes.
+    Using sr=chunk_sr (from the model) instead of the global SAMPLE_RATE
+    constant means the WAV header ALWAYS matches the actual data rate,
+    regardless of which model variant or wrapper is in use.
+
+    A complete WAV per chunk is required because:
+      • Browser decodeAudioData needs a full container (header + data).
+      • Clients can schedule each decoded AudioBuffer at a precise time
+        to achieve seamless, gap-free playback.
+      • No bespoke PCM-handling code is needed on the client side.
     """
-    bits_per_sample = 16
-    byte_rate   = sr * channels * bits_per_sample // 8
-    block_align = channels * bits_per_sample // 8
-    return struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF", 0xFFFFFFFF,
-        b"WAVE",
-        b"fmt ", 16,
-        1,               # PCM
-        channels,
-        sr,
-        byte_rate,
-        block_align,
-        bits_per_sample,
-        b"data", 0xFFFFFFFF,
-    )
+    buf = io.BytesIO()
+    sf.write(buf, audio_chunk, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
 
 
-def _audio_to_pcm16(audio_chunk: np.ndarray) -> bytes:
-    """Convert float32 [-1, 1] numpy array to raw little-endian int16 PCM."""
-    return (np.clip(audio_chunk, -1.0, 1.0) * 32767).astype("<i2").tobytes()
-
-
-def _chunk_pause_pcm(sr: int) -> bytes:
-    """Return inter-segment silence as raw PCM16 bytes (b'' when disabled)."""
-    n = int(sr * CHUNK_JOIN_SILENCE_MS / 1000.0)
-    return b"\x00" * (n * 2) if n > 0 else b""
+def _silence_wav_bytes(duration_ms: int, sr: int) -> bytes:
+    """Return a complete WAV file containing silence of the given duration."""
+    n_samples = int(sr * duration_ms / 1000)
+    if n_samples <= 0:
+        return b""
+    return _chunk_to_wav_bytes(np.zeros(n_samples, dtype=np.float32), sr)
 
 
 def _validate_text(text: str):
@@ -313,7 +313,7 @@ def _vram_info() -> dict:
     reserved  = torch.cuda.memory_reserved(0)
     total     = props.total_memory
     return {
-        "available": True,
+        "available":    True,
         "device":       props.name,
         "total_mb":     round(total     / 1024**2, 1),
         "allocated_mb": round(allocated / 1024**2, 1),
@@ -327,98 +327,71 @@ async def _run_in_executor(func):
 
 
 # ── Async streaming pipeline ──────────────────────────────────────────────────
-# Sentinels used as queue messages
 _QUEUE_DONE  = object()
 _QUEUE_ERROR = object()
 
 
 async def _stream_audio(
     iter_fns:  list,
-    sr:        int,
-    pause_pcm: bytes,
+    fallback_sr: int,
     cleanup:   Optional[callable] = None,
 ) -> None:
-    """Async generator that pipelines GPU inference and network I/O.
+    """Async generator — concurrent GPU inference + network I/O pipeline.
 
-    JITTER-FIX-1 + JITTER-FIX-2 are both implemented here.
+    Each queue item is a COMPLETE WAV file (complete header + PCM body) built
+    from the model's own chunk_sr.  The client calls decodeAudioData on each
+    chunk and schedules playback with precise AudioContext timing.
 
-    The producer thread:
-      • Iterates over all text-segment callables (iter_fns) in sequence.
-      • Converts each audio_chunk to int16 PCM immediately (avoids holding
-        large float32 arrays in the queue).
-      • Inserts inter-segment silence between segments.
-      • Puts items into a bounded queue.  The bound (PRE_ROLL_CHUNKS + 2)
-        means the producer runs PRE_ROLL_CHUNKS + 2 chunks ahead of the
-        consumer at all times — this is the per-segment pre-roll buffer that
-        hides model prefill latency at every text-segment boundary.
-
-    The consumer (this async generator):
-      • Awaits each queue.get via run_in_executor so the event loop stays free.
-      • Immediately yields each NDJSON line to Starlette / the client.
-      • Because the producer is always ahead, there is always a chunk ready —
-        no starvation gap even during GPU prefill of the next segment.
-
-    cancel_event:
-      • Set in the finally block if the consumer exits early (client disconnect,
-        exception).  The producer checks it after every chunk, ensuring the
-        background thread exits promptly instead of filling a queue nobody reads.
-      • After setting the event we drain the queue so the producer unblocks
-        from any blocking q.put call.
+    Queue size = PRE_ROLL_CHUNKS + 2 so the producer thread is always
+    PRE_ROLL_CHUNKS chunks ahead of the consumer, hiding both initial
+    startup latency and per-segment prefill latency (BUG-3 FIX).
     """
-    # +2 so the producer has a couple of extra slots to hide queue.put latency.
-    q = _stdlib_queue.Queue(maxsize=max(PRE_ROLL_CHUNKS, 0) + 2)
+    q            = _stdlib_queue.Queue(maxsize=max(PRE_ROLL_CHUNKS, 0) + 2)
     cancel_event = threading.Event()
 
     def _producer():
         try:
             for seg_idx, iter_fn in enumerate(iter_fns):
-                # Insert silence BEFORE starting the new segment so the
-                # consumer plays it while the model is doing prefill.
-                if seg_idx > 0 and pause_pcm:
+                # Silence BEFORE new segment so the consumer plays it
+                # concurrently with the model's prefill for that segment.
+                if seg_idx > 0 and CHUNK_JOIN_SILENCE_MS > 0:
                     if cancel_event.is_set():
                         return
-                    q.put(("pause", pause_pcm, sr, 0))
+                    # Use fallback_sr for silence; rate doesn't matter for zeros.
+                    sil = _silence_wav_bytes(CHUNK_JOIN_SILENCE_MS, fallback_sr)
+                    if sil:
+                        q.put(("wav", sil, fallback_sr, 0))
 
                 for audio_chunk, chunk_sr, _timing in iter_fn():
                     if cancel_event.is_set():
                         return
-                    pcm = _audio_to_pcm16(audio_chunk)
-                    q.put(("pcm", pcm, chunk_sr, len(audio_chunk)))
+                    # BUG-1 + BUG-2 FIX: complete WAV using model's chunk_sr.
+                    wav = _chunk_to_wav_bytes(audio_chunk, chunk_sr)
+                    q.put(("wav", wav, chunk_sr, len(audio_chunk)))
 
             q.put((_QUEUE_DONE,))
         except Exception as exc:
             q.put((_QUEUE_ERROR, exc))
 
-    loop = asyncio.get_event_loop()
+    loop         = asyncio.get_event_loop()
     producer_fut = loop.run_in_executor(None, _producer)
 
-    t_start      = time.perf_counter()
-    ttfa_ms      = None
-    first        = True
+    t_start       = time.perf_counter()
+    ttfa_ms       = None
+    first         = True
     total_samples = 0
 
     try:
-        # One streaming WAV header — client appends all subsequent raw PCM to
-        # this and plays the whole thing as one continuous audio stream.
-        yield json.dumps({
-            "format":      "wav_header",
-            "chunk":       base64.b64encode(_streaming_wav_header(sr)).decode(),
-            "sample_rate": sr,
-            "done":        False,
-        }) + "\n"
-
         while True:
-            # Blocking q.get runs in a thread so the event loop stays free.
             item = await loop.run_in_executor(None, q.get)
             tag  = item[0]
 
             if tag is _QUEUE_DONE:
                 break
-
             if tag is _QUEUE_ERROR:
                 raise item[1]
 
-            _, pcm_bytes, chunk_sr, n_samples = item
+            _, wav_bytes, chunk_sr, n_samples = item
             total_samples += n_samples
 
             if first:
@@ -426,18 +399,16 @@ async def _stream_audio(
                 first   = False
 
             yield json.dumps({
-                "format":      "pcm_s16le",
-                "chunk":       base64.b64encode(pcm_bytes).decode(),
+                "chunk":       base64.b64encode(wav_bytes).decode(),
                 "sample_rate": chunk_sr,
                 "done":        False,
             }) + "\n"
 
-        elapsed       = time.perf_counter() - t_start
-        total_duration = total_samples / max(sr, 1)
+        elapsed        = time.perf_counter() - t_start
+        total_duration = total_samples / max(fallback_sr, 1)
         yield json.dumps({
-            "format":      "done",
             "chunk":       "",
-            "sample_rate": sr,
+            "sample_rate": fallback_sr,
             "done":        True,
             "rtf":         round(elapsed / max(total_duration, 1e-6), 3),
             "ttfa_ms":     ttfa_ms,
@@ -450,18 +421,16 @@ async def _stream_audio(
         log.exception("Unexpected error in audio stream")
         yield json.dumps({"error": str(exc), "done": True}) + "\n"
     finally:
-        # Signal the producer to stop, then drain so it can unblock from q.put.
+        # Signal producer and drain queue so any blocking q.put() can exit.
         cancel_event.set()
         try:
             while True:
                 q.get_nowait()
         except _stdlib_queue.Empty:
             pass
-        await producer_fut   # wait for the background thread to exit cleanly
-
+        await producer_fut
         if cleanup:
             cleanup()
-
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -494,14 +463,13 @@ async def tts_custom(
     if speaker not in SPEAKERS:
         raise HTTPException(status_code=422, detail=f"Unknown speaker '{speaker}'. Choose from: {SPEAKERS}")
 
-    model = await _load_model(CUSTOM_MODEL_ID)
+    model       = await _load_model(CUSTOM_MODEL_ID)
     text_chunks = _split_text_for_tts(text)
-    pause = np.zeros(int(SAMPLE_RATE * CHUNK_JOIN_SILENCE_MS / 1000), dtype=np.float32)
+    pause       = np.zeros(int(SAMPLE_RATE * CHUNK_JOIN_SILENCE_MS / 1000), dtype=np.float32)
 
     try:
         merged: list[np.ndarray] = []
         sr = SAMPLE_RATE
-
         for idx, tc in enumerate(text_chunks):
             kw = dict(text=tc, language=language, speaker=speaker)
             if instruct:
@@ -510,7 +478,6 @@ async def tts_custom(
             if idx > 0 and pause.size > 0:
                 merged.append(pause)
             merged.extend(audio_list)
-
         wav = _to_wav_bytes(merged, sr)
     except torch.cuda.OutOfMemoryError:
         gc.collect(); torch.cuda.empty_cache()
@@ -535,9 +502,8 @@ async def tts_custom_stream(
     if speaker not in SPEAKERS:
         raise HTTPException(status_code=422, detail=f"Unknown speaker '{speaker}'. Choose from: {SPEAKERS}")
 
-    model = await _load_model(CUSTOM_MODEL_ID)
+    model       = await _load_model(CUSTOM_MODEL_ID)
     text_chunks = _split_text_for_tts(text)
-    pause_pcm   = _chunk_pause_pcm(SAMPLE_RATE)
     extra       = {"instruct": instruct} if instruct else {}
 
     def _make_iter(tc):
@@ -549,7 +515,7 @@ async def tts_custom_stream(
         return _iter
 
     return StreamingResponse(
-        _stream_audio([_make_iter(tc) for tc in text_chunks], SAMPLE_RATE, pause_pcm),
+        _stream_audio([_make_iter(tc) for tc in text_chunks], SAMPLE_RATE),
         media_type="application/x-ndjson",
     )
 
@@ -576,7 +542,6 @@ async def tts_clone(
     try:
         merged: list[np.ndarray] = []
         sr = SAMPLE_RATE
-
         for idx, tc in enumerate(text_chunks):
             audio_list, sr = await _run_in_executor(
                 lambda t=tc: model.generate_voice_clone(
@@ -587,7 +552,6 @@ async def tts_clone(
             if idx > 0 and pause.size > 0:
                 merged.append(pause)
             merged.extend(audio_list)
-
         wav = _to_wav_bytes(merged, sr)
     except torch.cuda.OutOfMemoryError:
         gc.collect(); torch.cuda.empty_cache()
@@ -617,8 +581,7 @@ async def tts_clone_stream(
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
-    model     = await _load_model(BASE_MODEL_ID)
-    pause_pcm = _chunk_pause_pcm(SAMPLE_RATE)
+    model = await _load_model(BASE_MODEL_ID)
 
     def _make_iter(tc):
         def _iter():
@@ -629,11 +592,11 @@ async def tts_clone_stream(
             )
         return _iter
 
-    def _cleanup():
-        pathlib.Path(tmp_path).unlink(missing_ok=True)
-
     return StreamingResponse(
-        _stream_audio([_make_iter(tc) for tc in text_chunks], SAMPLE_RATE, pause_pcm,
-                      cleanup=_cleanup),
+        _stream_audio(
+            [_make_iter(tc) for tc in text_chunks],
+            SAMPLE_RATE,
+            cleanup=lambda: pathlib.Path(tmp_path).unlink(missing_ok=True),
+        ),
         media_type="application/x-ndjson",
     )
