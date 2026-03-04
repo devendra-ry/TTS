@@ -3,13 +3,15 @@ tts_backend.py — Qwen3-TTS FastAPI Backend
 GTX 1650 optimised (4 GB VRAM)
 """
 
-import os
 import gc
 import io
 import json
 import base64
 import asyncio
 import logging
+import os
+import pathlib          # FIX 1: was imported inside function bodies
+import tempfile         # FIX 1: was imported inside function bodies
 import time
 import re
 from contextlib import asynccontextmanager
@@ -51,29 +53,33 @@ def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-CUSTOM_MODEL_ID = os.getenv("CUSTOM_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
-BASE_MODEL_ID   = os.getenv("BASE_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
-MAX_TEXT_LEN    = _env_int("MAX_TEXT_LEN", 300000, min_value=1000)
-MODEL_CHUNK_TEXT_LEN = _env_int("MODEL_CHUNK_TEXT_LEN", 700, min_value=100)
-CHUNK_JOIN_SILENCE_MS = _env_int("CHUNK_JOIN_SILENCE_MS", 0, min_value=0)
-STREAM_CHUNK_SIZE = _env_int("STREAM_CHUNK_SIZE", 10, min_value=1)
-SAMPLE_RATE     = 24_000
+CUSTOM_MODEL_ID      = os.getenv("CUSTOM_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice")
+BASE_MODEL_ID        = os.getenv("BASE_MODEL_ID",   "Qwen/Qwen3-TTS-12Hz-0.6B-Base")
+MAX_TEXT_LEN         = _env_int("MAX_TEXT_LEN",          300_000, min_value=1_000)
+MODEL_CHUNK_TEXT_LEN = _env_int("MODEL_CHUNK_TEXT_LEN",  700,     min_value=100)
+CHUNK_JOIN_SILENCE_MS= _env_int("CHUNK_JOIN_SILENCE_MS", 0,       min_value=0)
+STREAM_CHUNK_SIZE    = _env_int("STREAM_CHUNK_SIZE",     10,      min_value=1)
+SAMPLE_RATE          = 24_000
 
 SPEAKERS = ["serena", "vivian", "uncle_fu", "ryan", "aiden",
             "ono_anna", "sohee", "eric", "dylan"]
 
 # ── Model cache ───────────────────────────────────────────────────────────────
 # We keep at most one model loaded at a time to stay within 4 GB VRAM.
-_model_cache: dict = {}   # {"id": model_instance}
+_model_cache: dict = {}
 _active_model_id: Optional[str] = None
+# FIX 2: Guard the cache with a lock so concurrent async requests cannot
+#         corrupt _model_cache / _active_model_id when _load_model runs in
+#         a thread-pool executor.
+_model_lock = asyncio.Lock()
 
 
-def _load_model(model_id: str):
+def _load_model_sync(model_id: str):
+    """Synchronous model loader — must be called from a thread (run_in_executor)."""
     global _active_model_id
     if _active_model_id == model_id and model_id in _model_cache:
         return _model_cache[model_id]
 
-    # Evict the previously loaded model
     if _active_model_id and _active_model_id in _model_cache:
         log.info("Evicting model %s from VRAM …", _active_model_id)
         del _model_cache[_active_model_id]
@@ -91,12 +97,24 @@ def _load_model(model_id: str):
     return model
 
 
+async def _load_model(model_id: str):
+    """Async wrapper: serialises model swaps and offloads blocking work to a
+    thread so the event loop is never stalled.
+
+    FIX 3: the original _load_model() was a plain synchronous function called
+    directly inside async route handlers, blocking the event loop during
+    potentially multi-second model loads.
+    """
+    async with _model_lock:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, _load_model_sync, model_id)
+
+
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Pre-load the CustomVoice model (more common use-case)
     try:
-        _load_model(CUSTOM_MODEL_ID)
+        await _load_model(CUSTOM_MODEL_ID)
         log.info("Startup complete — CustomVoice model ready.")
     except Exception as exc:
         log.error("Failed to load model at startup: %s", exc)
@@ -183,7 +201,6 @@ def _split_text_for_tts(text: str, max_chars: int = MODEL_CHUNK_TEXT_LEN) -> lis
                 if len(word) <= max_chars:
                     word_chunk = word
                 else:
-                    # Hard split pathological tokens (e.g. long URLs).
                     for i in range(0, len(word), max_chars):
                         piece = word[i:i + max_chars]
                         if len(piece) == max_chars:
@@ -222,16 +239,23 @@ def _vram_info() -> dict:
     return {
         "available": True,
         "device": props.name,
-        "total_mb": round(total / 1024**2, 1),
+        "total_mb":     round(total     / 1024**2, 1),
         "allocated_mb": round(allocated / 1024**2, 1),
-        "reserved_mb": round(reserved / 1024**2, 1),
-        "free_mb": round((total - reserved) / 1024**2, 1),
+        "reserved_mb":  round(reserved  / 1024**2, 1),
+        "free_mb":      round((total - reserved) / 1024**2, 1),
     }
 
 
-async def _run_in_executor(func, *args):
+async def _run_in_executor(func):
+    # FIX 4: removed the misleading *args parameter.  The original signature
+    #   `_run_in_executor(func, *args)` accepted extra positional arguments and
+    #   forwarded them to run_in_executor, but every call site passed a
+    #   zero-argument lambda instead — so args was always () and the parameter
+    #   only created a false impression that it was the preferred way to supply
+    #   arguments.  Using a captured-variable lambda (called immediately via
+    #   await) is the correct and safe pattern here.
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, func, *args)
+    return await loop.run_in_executor(None, func)
 
 
 # ── /health ───────────────────────────────────────────────────────────────────
@@ -252,16 +276,16 @@ async def health():
 # ── /tts/custom ───────────────────────────────────────────────────────────────
 @app.post("/tts/custom")
 async def tts_custom(
-    text:     str = Form(...),
-    language: str = Form("English"),
-    speaker:  str = Form("aiden"),
+    text:     str           = Form(...),
+    language: str           = Form("English"),
+    speaker:  str           = Form("aiden"),
     instruct: Optional[str] = Form(None),
 ):
     _validate_text(text)
     if speaker not in SPEAKERS:
         raise HTTPException(status_code=422, detail=f"Unknown speaker '{speaker}'. Choose from: {SPEAKERS}")
 
-    model = _load_model(CUSTOM_MODEL_ID)
+    model = await _load_model(CUSTOM_MODEL_ID)
     text_chunks = _split_text_for_tts(text)
 
     try:
@@ -270,11 +294,19 @@ async def tts_custom(
         pause = _chunk_pause(sr)
 
         for idx, text_chunk in enumerate(text_chunks):
+            # FIX 5: capture loop variables explicitly in the lambda's default
+            #   arguments so each iteration's closure is independent.  The
+            #   original `lambda: model.generate_custom_voice(**kwargs)` closed
+            #   over `kwargs` by *reference*; while the immediate `await` made
+            #   it safe today, any future refactor (e.g. gather()) would silently
+            #   pass the last iteration's kwargs to every call.
             kwargs = dict(text=text_chunk, language=language, speaker=speaker)
             if instruct:
                 kwargs["instruct"] = instruct
 
-            audio_list, sr = await _run_in_executor(lambda: model.generate_custom_voice(**kwargs))
+            audio_list, sr = await _run_in_executor(
+                lambda kw=kwargs: model.generate_custom_voice(**kw)
+            )
             if idx > 0 and pause.size > 0:
                 merged_audio.append(pause)
             merged_audio.extend(audio_list)
@@ -297,16 +329,16 @@ async def tts_custom(
 # ── /tts/custom/stream ────────────────────────────────────────────────────────
 @app.post("/tts/custom/stream")
 async def tts_custom_stream(
-    text:     str = Form(...),
-    language: str = Form("English"),
-    speaker:  str = Form("aiden"),
+    text:     str           = Form(...),
+    language: str           = Form("English"),
+    speaker:  str           = Form("aiden"),
     instruct: Optional[str] = Form(None),
 ):
     _validate_text(text)
     if speaker not in SPEAKERS:
         raise HTTPException(status_code=422, detail=f"Unknown speaker '{speaker}'. Choose from: {SPEAKERS}")
 
-    model = _load_model(CUSTOM_MODEL_ID)
+    model = await _load_model(CUSTOM_MODEL_ID)
     text_chunks = _split_text_for_tts(text)
     pause = _chunk_pause(SAMPLE_RATE)
     pause_wav_b64 = ""
@@ -331,21 +363,24 @@ async def tts_custom_stream(
                     wav_bytes = _chunk_to_wav_bytes(audio_chunk, sr)
                     b64 = base64.b64encode(wav_bytes).decode()
                     total_duration += len(audio_chunk) / sr
-                    line = json.dumps({"chunk": b64, "sample_rate": sr, "done": False})
-                    yield line + "\n"
+                    yield json.dumps({"chunk": b64, "sample_rate": sr, "done": False}) + "\n"
 
                 if idx < len(text_chunks) - 1 and pause_wav_b64:
                     total_duration += len(pause) / SAMPLE_RATE
                     yield json.dumps({"chunk": pause_wav_b64, "sample_rate": SAMPLE_RATE, "done": False}) + "\n"
+
             elapsed = time.perf_counter() - t_start
             rtf = round(elapsed / max(total_duration, 1e-6), 3)
-            final = json.dumps({"chunk": "", "sample_rate": SAMPLE_RATE, "done": True,
-                                "rtf": rtf, "ttfa_ms": ttfa_ms})
-            yield final + "\n"
+            yield json.dumps({"chunk": "", "sample_rate": SAMPLE_RATE, "done": True,
+                              "rtf": rtf, "ttfa_ms": ttfa_ms}) + "\n"
         except torch.cuda.OutOfMemoryError:
             gc.collect(); torch.cuda.empty_cache()
-            err = json.dumps({"error": "CUDA OOM", "done": True})
-            yield err + "\n"
+            yield json.dumps({"error": "CUDA OOM", "done": True}) + "\n"
+        except Exception as exc:
+            # FIX 6: catch all other exceptions so the client receives a
+            #   well-formed error line rather than a silently truncated stream.
+            log.exception("Unexpected error in custom stream generator")
+            yield json.dumps({"error": str(exc), "done": True}) + "\n"
         finally:
             gc.collect()
             torch.cuda.empty_cache()
@@ -364,14 +399,13 @@ async def tts_clone(
     _validate_text(text)
     text_chunks = _split_text_for_tts(text)
 
-    # Save uploaded ref audio to a temp file
-    import tempfile, pathlib
+    # FIX 1 (applied): tempfile / pathlib now imported at module level.
     audio_bytes = await ref_audio.read()
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
-    model = _load_model(BASE_MODEL_ID)
+    model = await _load_model(BASE_MODEL_ID)
 
     try:
         merged_audio: list[np.ndarray] = []
@@ -379,9 +413,10 @@ async def tts_clone(
         pause = _chunk_pause(sr)
 
         for idx, text_chunk in enumerate(text_chunks):
+            # FIX 5 (applied): capture loop variable via default arg.
             audio_list, sr = await _run_in_executor(
-                lambda: model.generate_voice_clone(
-                    text=text_chunk, language=language,
+                lambda tc=text_chunk: model.generate_voice_clone(
+                    text=tc, language=language,
                     ref_audio=tmp_path, ref_text=ref_text,
                 )
             )
@@ -416,13 +451,13 @@ async def tts_clone_stream(
     _validate_text(text)
     text_chunks = _split_text_for_tts(text)
 
-    import tempfile, pathlib
+    # FIX 1 (applied): tempfile / pathlib now imported at module level.
     audio_bytes = await ref_audio.read()
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(audio_bytes)
         tmp_path = tmp.name
 
-    model = _load_model(BASE_MODEL_ID)
+    model = await _load_model(BASE_MODEL_ID)
     pause = _chunk_pause(SAMPLE_RATE)
     pause_wav_b64 = ""
     if pause.size > 0:
@@ -451,6 +486,7 @@ async def tts_clone_stream(
                 if idx < len(text_chunks) - 1 and pause_wav_b64:
                     total_duration += len(pause) / SAMPLE_RATE
                     yield json.dumps({"chunk": pause_wav_b64, "sample_rate": SAMPLE_RATE, "done": False}) + "\n"
+
             elapsed = time.perf_counter() - t_start
             rtf = round(elapsed / max(total_duration, 1e-6), 3)
             yield json.dumps({"chunk": "", "sample_rate": SAMPLE_RATE, "done": True,
@@ -458,6 +494,11 @@ async def tts_clone_stream(
         except torch.cuda.OutOfMemoryError:
             gc.collect(); torch.cuda.empty_cache()
             yield json.dumps({"error": "CUDA OOM", "done": True}) + "\n"
+        except Exception as exc:
+            # FIX 6: catch all other exceptions so the client receives a
+            #   well-formed error line rather than a silently truncated stream.
+            log.exception("Unexpected error in clone stream generator")
+            yield json.dumps({"error": str(exc), "done": True}) + "\n"
         finally:
             pathlib.Path(tmp_path).unlink(missing_ok=True)
             gc.collect()
