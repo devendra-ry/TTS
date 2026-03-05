@@ -1,9 +1,18 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 
 /* ─── Constants ─────────────────────────────────────────────────────────── */
-const API = "http://localhost:8000";
+function getApiBase() {
+  const envUrl = import.meta.env.VITE_API_BASE_URL;
+  if (envUrl) return envUrl.replace(/\/$/, "");
+  if (typeof window !== "undefined") {
+    return `${window.location.protocol}//${window.location.hostname}:8000`;
+  }
+  return "http://localhost:8000";
+}
+
+const API = getApiBase();
 const DEFAULT_MAX = 300000;
-const SPEAKER_IDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+const DEFAULT_SPEAKER_IDS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
 
 /* ─── Audio helpers ──────────────────────────────────────────────────────── */
 function base64ToArrayBuffer(b64) {
@@ -101,6 +110,14 @@ export default function CSMTTS() {
   const startedRef = useRef(false);
 
   const maxText = health?.max_text_length ?? DEFAULT_MAX;
+  const speakerRange = health?.speaker_id_range;
+  const speakerIds = Array.isArray(speakerRange) && speakerRange.length === 2
+    ? Array.from({ length: speakerRange[1] - speakerRange[0] + 1 }, (_, i) => speakerRange[0] + i)
+    : DEFAULT_SPEAKER_IDS;
+  const speakerOptions = speakerIds.map((id) => ({
+    id,
+    label: health?.voice_labels?.[String(id)] ?? `Voice ${id}`,
+  }));
 
   useEffect(() => {
     const poll = async () => {
@@ -123,6 +140,14 @@ export default function CSMTTS() {
     nextPlayRef.current = 0;
     startedRef.current = false;
   }, [audioUrl]);
+  const setAudioAndAutoplay = useCallback((url) => {
+    setAudioUrl(url);
+    requestAnimationFrame(() => {
+      audioRef.current?.play().catch(() => {
+        setStatus("Done. Click play if autoplay was blocked by the browser.");
+      });
+    });
+  }, []);
 
   /* ── Non-streaming ──────────────────────────────────────────────────────── */
   const runNonStream = async (fd, endpoint) => {
@@ -131,7 +156,9 @@ export default function CSMTTS() {
     abortRef.current = ctrl;
     const r = await fetch(`${API}${endpoint}`, { method: "POST", body: fd, signal: ctrl.signal });
     if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j.detail || `HTTP ${r.status}`); }
-    setAudioUrl(URL.createObjectURL(await r.blob()));
+    const wavBlob = await r.blob();
+    if (wavBlob.size <= 44) throw new Error("Model returned an empty WAV (no audio samples).");
+    setAudioAndAutoplay(URL.createObjectURL(wavBlob));
     setStatus("Done.");
   };
 
@@ -153,6 +180,8 @@ export default function CSMTTS() {
     startedRef.current = false;
 
     const allChunks = [];
+    let decodedChunks = 0;
+    let decodeFailures = 0;
     let sr = 24000;
 
     const r = await fetch(`${API}${endpoint}`, { method: "POST", body: fd, signal: ctrl.signal });
@@ -201,7 +230,9 @@ export default function CSMTTS() {
           src.start(nextPlayRef.current);
           // Advance by exact decoded duration → chunks tile with zero gap.
           nextPlayRef.current += audioBuf.duration;
+          decodedChunks += 1;
         } catch (e) {
+          decodeFailures += 1;
           console.warn("decodeAudioData failed:", e);
         }
       }
@@ -209,7 +240,11 @@ export default function CSMTTS() {
 
     if (allChunks.length) {
       const blob = wavChunksToBlob(allChunks, sr);
-      if (blob) setAudioUrl(URL.createObjectURL(blob));
+      if (blob) setAudioAndAutoplay(URL.createObjectURL(blob));
+    }
+    if (!allChunks.length) throw new Error("Stream ended without any audio chunks.");
+    if (!decodedChunks && decodeFailures > 0) {
+      throw new Error("Received chunks, but the browser failed to decode audio. Try non-stream mode.");
     }
   };
 
@@ -251,7 +286,7 @@ export default function CSMTTS() {
 
       {/* Top bar */}
       <div style={S.topBar}>
-        <span style={S.logo}>◈ CSM-1B TTS</span>
+        <span style={S.logo}>◈ Kokoro-82M TTS</span>
         <span style={S.health(!!health)}>
           <span style={S.dot(!!health)} />
           {health
@@ -264,15 +299,15 @@ export default function CSMTTS() {
         <div>
           <div style={S.heading}>Text-to-Speech</div>
           <div style={{ ...S.sub, marginTop: 6 }}>
-            sesame/csm-1b · English · {maxText.toLocaleString()} char limit
+            hexgrad/Kokoro-82M · English · {maxText.toLocaleString()} char limit
           </div>
         </div>
 
         {/* Model info */}
         <div style={S.infoBox}>
-          <strong style={{ color: "#7b9fff" }}>CSM-1B</strong> by Sesame — Llama backbone + Mimi vocoder.
+          <strong style={{ color: "#7b9fff" }}>Kokoro-82M</strong> by hexgrad.
           &nbsp;<strong style={{ color: "#7b9fff" }}>English only.</strong>
-          &nbsp;Speaker IDs 0–9 select different built-in voice identities (0 = default neutral voice).
+          &nbsp;Speaker IDs 0–9 map to preset Kokoro voices.
         </div>
 
         {/* Input panel */}
@@ -297,8 +332,8 @@ export default function CSMTTS() {
               <span style={{ color: "#2a3050", marginLeft: 6 }}>0–9</span>
             </label>
             <select style={S.select} value={speakerId} onChange={e => setSpeakerId(Number(e.target.value))}>
-              {SPEAKER_IDS.map(id => (
-                <option key={id} value={id}>{id === 0 ? `${id} (default)` : id}</option>
+              {speakerOptions.map(({ id, label }) => (
+                <option key={id} value={id}>{`${id} · ${label}`}</option>
               ))}
             </select>
           </div>
@@ -353,3 +388,8 @@ export default function CSMTTS() {
     </div>
   );
 }
+
+
+
+
+
