@@ -1,9 +1,9 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import QwenTTS from "./qwen-tts.jsx";
+import KokoroTTS from "./KokoroTTS.jsx";
 
 ReactDOM.createRoot(document.getElementById("root")).render(
   <React.StrictMode>
-    <QwenTTS />
+    <KokoroTTS />
   </React.StrictMode>
 );
